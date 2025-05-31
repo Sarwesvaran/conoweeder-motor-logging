@@ -81,6 +81,11 @@ const unsigned long internetCheckInterval = 10000; // Check every 10 seconds
 unsigned long internetUnavailableSince = 0;
 const unsigned long internetUnavailableTimeout = 60000; // Restart after 1 minute
 
+// Time synchronization
+const int TIME_SYNC_RETRIES = 5;
+const int TIME_SYNC_RETRY_DELAY = 2000; // 2 seconds between retries
+bool timeSyncSuccess = false;
+
 bool alert = true;
 
 // Watchdog timer
@@ -90,6 +95,28 @@ void tokenStatusCallback(TokenInfo info);
 
 void feedWatchdog() {
   esp_task_wdt_reset();
+}
+
+bool syncTimeWithRetries() {
+  feedWatchdog();
+  configTime(19800, 0, ntpServer); // IST timezone (UTC+5:30)
+  
+  for (int attempt = 1; attempt <= TIME_SYNC_RETRIES; attempt++) {
+    Serial.printf("Attempting time sync (attempt %d/%d)...\n", attempt, TIME_SYNC_RETRIES);
+    
+    time_t now = time(nullptr);
+    if (now > 1600000000) { // If we got a valid time (after year 2000)
+      Serial.println("Time synchronization successful");
+      return true;
+    }
+    
+    if (attempt < TIME_SYNC_RETRIES) {
+      delay(TIME_SYNC_RETRY_DELAY);
+    }
+  }
+  
+  Serial.println("Time synchronization failed after all retries");
+  return false;
 }
 
 void sendResult(String time, float volt, float current, float power, int rpm, int totalRuntimeMinutes) {
@@ -133,10 +160,15 @@ void tokenStatusCallback(TokenInfo info) {
 
 String getTime() {
   feedWatchdog();
+  if (!timeSyncSuccess) {
+    return "Time not synced";
+  }
+  
   time_t now;
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo))
-    return "None";
+  if (!getLocalTime(&timeinfo)) {
+    return "Time error";
+  }
 
   time(&now);
   now += (5 * 3600) + (30 * 60); // IST (UTC+5:30)
@@ -273,12 +305,12 @@ void attemptSheetUpdate() {
   feedWatchdog();
   if (GSheet.ready() && motorRunning && !isnan(PZEMVoltage)) {
     current_time = getTime();
-    if (current_time != "None") {
+    if (current_time != "Time not synced" && current_time != "Time error") {
       Serial.print("Now time is :");
       Serial.println(current_time);
       sendResult(current_time, PZEMVoltage, PZEMCurrent, PZEMPower, RPM, totalRuntimeMinutes);
     } else {
-      Serial.println("Time update failed");
+      Serial.println("Time not available for sheet update");
     }
   } else {
     Serial.println("G sheets not ready");
@@ -310,7 +342,7 @@ void checkInternetConnection() {
 }
 
 void checkBlynkConnection(void *pvParameters) {
-  esp_task_wdt_add(NULL); // Add this task to watchdog monitoring
+  esp_task_wdt_add(NULL);
   
   while (true) {
     feedWatchdog();
@@ -331,7 +363,7 @@ void checkBlynkConnection(void *pvParameters) {
 }
 
 void loop2(void *pvParameters) {
-  esp_task_wdt_add(NULL); // Add this task to watchdog monitoring
+  esp_task_wdt_add(NULL);
   
   while (true) {
     feedWatchdog();
@@ -394,7 +426,7 @@ void loop2(void *pvParameters) {
 }
 
 void googleSheetsTask(void *pvParameters) {
-  esp_task_wdt_add(NULL); // Add this task to watchdog monitoring
+  esp_task_wdt_add(NULL);
   
   unsigned long lastTaskRun = millis();
   const unsigned long initialDelay = 30000;
@@ -421,8 +453,8 @@ void googleSheetsTask(void *pvParameters) {
 
 void setup() {
   // Initialize hardware watchdog
-  esp_task_wdt_init(WDT_TIMEOUT, true); // Panic if not fed in time
-  esp_task_wdt_add(NULL); // Add main loop to watchdog
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL);
 
   Serial.begin(115200);
   delay(1000);
@@ -430,16 +462,10 @@ void setup() {
   EEPROM.begin(512);
   loadRuntimeFromEEPROM();
 
-  configTime(19800, 0, ntpServer);
-  GSheet.printf("ESP Google Sheet Client v%s\n\n", ESP_GOOGLE_SHEET_CLIENT_VERSION);
-
-  pinMode(hallSensorPin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(hallSensorPin), countRotation, FALLING);
-
+  // Initialize WiFi with timeout
   WiFi.begin(ssid, pass);
   Serial.println("Connecting to WiFi...");
   
-  // Wait for WiFi connection with timeout
   unsigned long wifiStartTime = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - wifiStartTime < 30000) {
     delay(500);
@@ -447,12 +473,23 @@ void setup() {
     feedWatchdog();
   }
   
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected");
-  } else {
+  if (WiFi.status() != WL_CONNECTED) {
     Serial.println("\nWiFi connection failed - restarting");
     ESP.restart();
   }
+  Serial.println("\nWiFi connected");
+
+  // Attempt time synchronization with retries
+  timeSyncSuccess = syncTimeWithRetries();
+  if (!timeSyncSuccess) {
+    Serial.println("Critical time sync failure - restarting ESP32");
+    ESP.restart();
+  }
+
+  GSheet.printf("ESP Google Sheet Client v%s\n\n", ESP_GOOGLE_SHEET_CLIENT_VERSION);
+
+  pinMode(hallSensorPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(hallSensorPin), countRotation, FALLING);
 
   Blynk.config(auth);
   blynkConnected = Blynk.connect();
